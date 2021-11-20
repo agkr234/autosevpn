@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 set -x
 
@@ -13,7 +13,7 @@ int2ip(){
 }
 
 
-DEST_ADDR=${DEST_ADDR:-"103.151.65.25"}
+#DEST_ADDR=${DEST_ADDR:-"103.151.65.25"}
 
 VIRTUAL_HUB=${VIRTUAL_HUB:-"VPNGATE"}
 NIC_NAME=${NIC_NAME:-"default"}
@@ -22,7 +22,7 @@ VPN_SERVER=${VPN_SERVER:-"localhost"}
 VPN_PORT=${VPN_PORT:-"443"}
 TAP_IPADDR=${TAP_IPADDR:-""}
 ACCOUNT_NAME=${ACCOUNT_NAME:-"myconnection"}
-NET_MASK=${NET_MASK:-"255.255.255.255"}
+#NET_MASK=${NET_MASK:-"255.255.255.255"}
 IP_REQ_ADDR=${IP_REQ_ADDR:-""}
 
 ACCOUNT_PASS_TYPE=standard
@@ -66,11 +66,14 @@ done
 
 route del default gw $VPN_DEFAULT_GATEWAY
 route add default gw $VPN_DEFAULT_GATEWAY metric 1 vpn_$LOWER_NIC_NAME
-if [ "$NET_MASK" != "255.255.255.255" ]; then
-	route add -net $DEST_ADDR netmask $NET_MASK gw $VPN_DEFAULT_GATEWAY vpn_$LOWER_NIC_NAME
-else
-	route add -host $DEST_ADDR gw $VPN_DEFAULT_GATEWAY vpn_$LOWER_NIC_NAME
-fi;
+
+for (( i=0; i<${#NET_MASK[@]}; i++ )); do
+	if [ "${NET_MASK[$i]}" != "255.255.255.255" ]; then
+		route add -net ${DEST_ADDR[$i]} netmask ${NET_MASK[$i]} gw $VPN_DEFAULT_GATEWAY vpn_$LOWER_NIC_NAME
+	else
+		route add -host ${DEST_ADDR[$i]} gw $VPN_DEFAULT_GATEWAY vpn_$LOWER_NIC_NAME
+	fi;
+done
 
 route add -host $(getent hosts $IP_REQ_ADDR | awk '{ print $1 }') gw $VPN_DEFAULT_GATEWAY vpn_$LOWER_NIC_NAME
 

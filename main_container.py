@@ -26,7 +26,7 @@ reliable_srvs_idx = 0
 dest_addr = None
 net_mask = None
 
-def init():
+def init(setting):
     global CUR_VPN_ADDR
     global CUR_VPN_PORT
     global LAST_VPNS
@@ -40,7 +40,7 @@ def init():
             continue
         res = sevpn.getping(srv[0], COUNT, interface=None, port=srv[1], timeout=1)
         if res[0] != 999:
-            if sevpn.connect_vpn({'ip': srv[0], 'port': int(srv[1])}, dest_addr, net_mask, check_target_ping):
+            if sevpn.connect_vpn({'ip': srv[0], 'port': int(srv[1])}, (setting), check_target_ping):
                 CUR_VPN_ADDR = srv[0]
                 CUR_VPN_PORT = int(srv[1])
                 LAST_VPNS.append(CUR_VPN_ADDR)
@@ -166,7 +166,7 @@ if __name__=='__main__':
         sock.bind(('', 0))
         while True:
             #sevpn.query_oq_table()
-            if not init():
+            if not init(sys.argv[1]):
                 logger.error("couldn't find any vpn to connect")
                 exit()
             #p = subprocess.Popen([QWFWD_START_PATH], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

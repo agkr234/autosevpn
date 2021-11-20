@@ -19,6 +19,7 @@ import logging.handlers
 import os
 import configparser
 import json
+import argparse
 
 logging.basicConfig(level=logging.DEBUG, format='%(message)s')
 logger = logging.getLogger(__name__)
@@ -52,9 +53,11 @@ net_mask=None
 sevpn999_skip=None
 unreach_skip=None
 
+tables = []
 oq_srvs = None
 oq_srvs_idx = 0
 
+ping_srvs={}
 
 def get_logger_handlers(modulename):
     sh = logging.StreamHandler(sys.stdout)
@@ -240,50 +243,44 @@ def get_oq_srv():
     oq_srvs_idx = (oq_srvs_idx + 1) % len(oq_srvs)
     return ping_srv
 
-
-def record_guam_ping(argv):
-    conn = argv[0]
-    cur = argv[1]
-    srv = argv[2]
-    id = argv[3]
-    dtime = argv[4]
-    failed_list = []
-    connected=True
-    count = len(oq_srvs) if len(oq_srvs) < 4 else 4
-    for _ in range(count):
-        ping_srv = get_oq_srv()
-        res = getping(ping_srv, COUNT, interface=NIC_NAME)
-        if res[0] == 999:
-            failed_list.append(ping_srv)
+def record_target_ping(argv):
+    conn, cur, srv, id, dtime, update_tables = argv
+    for table in update_tables:
+        failed_list = []
+        p_addrs = ping_srvs[table]['reliable']
+        count = len(p_addrs) if len(p_addrs) < 4 else 4
+        for _ in range(count):
+            ping_srv = p_addrs[ping_srvs[table]['idx']]
+            ping_srvs[table]['idx'] += 1
+            ping_srvs[table]['idx'] %= len(p_addrs)
+            res = getping(ping_srv, COUNT, interface=NIC_NAME)
+            if res[0] == 999:
+                failed_list.append(ping_srv)
+            else:
+                break
         else:
-            break
-    else:
-        connected=False
-    cur.execute(
-        'INSERT INTO {} VALUES ({}, "{}", {}, {}, {}, {}, {}, {}, "{}", "{}")'.format(ping_table, id,
-                                                                                             srv['ip'],
-                                                                                             srv['port'],
-                                                                                             res[0], res[1],
-                                                                                             res[2],
-                                                                                             res[3], COUNT,
-                                                                                             ping_srv,
-                                                                                             dtime))
-    # increment items of 999 oneqode server on the table
-    if failed_table:
-        for failed_ip in failed_list:
-            # update oneqode_srvs, (SELECT id FROM oneqode_srvs WHERE addr='103.151.64.8' ORDER BY last_update DESC LIMIT 1) AS o SET oneqode_srvs.failed=oneqode_srvs.failed+1 WHERE oneqode_srvs.id = o.id;
-            # update oneqode_srvs SET oneqode_srvs.failed=oneqode_srvs.failed+1 WHERE id IN (SELECT id FROM (SELECT MAX(last_update) FROM oneqode_srvs WHERE addr='103.151.64.8' AND addr='103.151.64.8') AS t );
-            cur.execute(
-                'update {} SET failed=failed+1 WHERE last_update=(SELECT MAX(last_update) FROM (SELECT * FROM {}) AS t WHERE addr="{}") AND addr="{}";'.format(failed_table, failed_table,
-                    failed_ip, failed_ip))
+            srvs_str = ' '.join(failed_list)
+            vpn_ipport = ':'.join([srv['ip'], srv['port']])
+            logger.warning('It seems {} cannot reach {}'.format(vpn_ipport, srvs_str))
+        cur.execute(
+            'INSERT INTO {} VALUES ({}, "{}", {}, {}, {}, {}, {}, {}, "{}", "{}")'.format(config[table]['ping_table'], id,
+                                                                                                srv['ip'],
+                                                                                                srv['port'],
+                                                                                                res[0], res[1],
+                                                                                                res[2],
+                                                                                                res[3], COUNT,
+                                                                                                ping_srv,
+                                                                                                dtime))
+        # increment items of 999 oneqode server on the table
+        if 'failed_table' in config[table]:
+            for failed_ip in failed_list:
+                # update oneqode_srvs, (SELECT id FROM oneqode_srvs WHERE addr='103.151.64.8' ORDER BY last_update DESC LIMIT 1) AS o SET oneqode_srvs.failed=oneqode_srvs.failed+1 WHERE oneqode_srvs.id = o.id;
+                # update oneqode_srvs SET oneqode_srvs.failed=oneqode_srvs.failed+1 WHERE id IN (SELECT id FROM (SELECT MAX(last_update) FROM oneqode_srvs WHERE addr='103.151.64.8' AND addr='103.151.64.8') AS t );
+                cur.execute(
+                    'update {} SET failed=failed+1 WHERE last_update=(SELECT MAX(last_update) FROM (SELECT * FROM {}) AS t WHERE addr="{}") AND addr="{}";'.format(config[table]['failed_table'], config[table]['failed_table'],
+                        failed_ip, failed_ip))
+        logger.debug('addr:{} (avg:{} max:{} min:{} ploss:{}) to (table:{} ip:{})'.format(srv['ip'], res[0], res[1], res[2], res[3], table, ping_srv))
     conn.commit()
-    if not connected:
-        #raise ConnectedPingError(srv['ip'], srv['port'], failed_list)
-        srvs_str = ' '.join(failed_list)
-        vpn_ipport = ':'.join([srv['ip'], srv['port']])
-        logger.warning('It seems {} cannot reach {}'.format(vpn_ipport, srvs_str))
-        return False
-    logger.debug('addr:{} (avg:{} max:{} min:{} ploss:{}'.format(srv['ip'], res[0], res[1], res[2], res[3]))
     return True
 
 
@@ -302,17 +299,24 @@ def disconnect_vpn(ip):
             p.terminate()
             break
         time.sleep(0.5)
+    subprocess.run("pkill dhclient", shell=True)
 
 
-def connect_vpn(srv, dest, mask, callback=None, argv=None):
+def connect_vpn(srv, update_tables, callback=None, argv=None):
     try:
+        mask = ' '
+        dest = ' '
+        for table in update_tables:
+            mask += '"{}" '.format(config[table]['net_mask'])
+            dest += '"{}" '.format(config[table]['dest_addr'])
         proc = procrun(
-            'VPN_SERVER="{}" VPN_PORT="{}" TAP_IPADDR="dhclient" NIC_NAME="default" IP_REQ_ADDR="{}" DEST_ADDR="{}" NET_MASK="{}" sh start.sh'.format(
+            'bash -c \'VPN_SERVER="{}"; VPN_PORT="{}"; TAP_IPADDR="dhclient"; NIC_NAME="default"; IP_REQ_ADDR="{}"; declare -a NET_MASK=({}); declare -a DEST_ADDR=({}); . ./start.sh\''.format(
                 srv['ip'],
-                srv['port'], get_host_fromurl(IP_REQ_ADDR), dest, mask))
+                srv['port'], get_host_fromurl(IP_REQ_ADDR), mask, dest))
         if proc.returncode:
             logger.debug("start.sh returned error code {} {}".format(proc.returncode, srv['ip']))
             raise Exception()
+        subprocess.run("pkill dhclient", shell=True)
         for _ in range(4):
             cur_globalip = get_globalip()
             if cur_globalip != GLOBAL_IP:
@@ -338,6 +342,22 @@ def sql_fetchoneone(cur, cmd):
     return cur.fetchone()[0]
 
 
+def check_update_time(cur, table, srv, skip_var):
+    cur.execute('SELECT ping_avg, NOW() - last_update FROM {} WHERE last_update IN (SELECT MAX(last_update) FROM {} GROUP BY addr) AND addr = \'{}\' AND port = {}'.format(table, table, srv['ip'], srv['port']))
+    last_trg_try = cur.fetchone()
+    if last_trg_try:
+        ping = last_trg_try[0]
+        elapsed = last_trg_try[1]
+        if not skip_var and ping == 999:
+            return True
+        elif elapsed < 7000: # 30 MINUTE
+            logger.debug('Too early to ping to {} in {}'.format(srv['ip'], table))
+            return False
+    return True
+
+
+
+
 COUNT = 4
 #SELECT addr, ping_avg, MAX(last_update) FROM guam_ping WHERE last_update IN (SELECT MAX(last_update) FROM guam_ping GROUP BY addr) AND addr = '219.100.37.132' AND last_update > NOW() - INTERVAL 1 DAY;
 def update_ping(srvs):
@@ -350,35 +370,15 @@ def update_ping(srvs):
                 continue
             conn = get_conn(None)
             cur = conn.cursor()
-            cur.execute('SELECT ping_avg, NOW() - last_update FROM {} WHERE last_update IN (SELECT MAX(last_update) FROM {} GROUP BY addr) AND addr = \'{}\' AND port = {}'.format(sevpn_table, sevpn_table, srv['ip'], srv['port']))
-            last_se_try = cur.fetchone()
-            if last_se_try:
-                ping = last_se_try[0]
-                elapsed = last_se_try[1]
-                if not sevpn999_skip and ping == 999:
-                    pass
-                elif elapsed < 7000: # 30 MINUTE
-                    logger.debug('1 Too early to ping to {}'.format(srv['ip']))
-                    continue
-            cur.execute('SELECT ping_avg, NOW() - last_update FROM {} WHERE last_update IN (SELECT MAX(last_update) FROM {} GROUP BY addr) AND addr = \'{}\' AND port = {}'.format(ping_table, ping_table, srv['ip'], srv['port']))
-            last_trg_try = cur.fetchone()
-            if last_trg_try:
-                ping = last_trg_try[0]
-                elapsed = last_trg_try[1]
-                if not unreach_skip and ping == 999:
-                    pass
-                elif elapsed < 7000: # 30 MINUTE
-                    logger.debug('2 Too early to ping to {}'.format(srv['ip']))
-                    continue
-            """last_failed = sql_fetchone(cur, 'SELECT COUNT(*) FROM {} WHERE last_update IN (SELECT MAX(last_update) FROM {} GROUP BY addr) AND addr = \'{}\' AND port = {} AND last_update > NOW() - INTERVAL 30 MINUTE;'.format(sevpn_failed_table, sevpn_failed_table, srv['ip'], srv['port']))
-            if last_failed > 0:
-                logger.debug('{} failed to be connected within last 30 minutes. skipped'.format(srv['ip']))
+            if not check_update_time(cur, sevpn_table, srv, config.getboolean('general', 'sevpn999_skip')):
                 continue
-            if unreach_table:
-                last_unreach = sql_fetchone(cur, 'SELECT COUNT(*) FROM {} WHERE last_update IN (SELECT MAX(last_update) FROM {} GROUP BY addr) AND addr = \'{}\' AND port = {} AND last_update > NOW() - INTERVAL 30 MINUTE;'.format(unreach_table, unreach_table, srv['ip'], srv['port']))
-                if last_unreach > 0:
-                    logger.debug('{} failed to reach target address within last 30 minutes. skipped'.format(srv['ip']))
-                    continue"""
+            update_tables=[]
+            for table in tables:
+                if check_update_time(cur, config[table]['ping_table'], srv, config.getboolean(table, 'unreach_skip')):
+                    update_tables.append(table)
+            if not update_tables:
+                logger.debug("no need to update for {}. skipping".format(srv['ip']))
+                continue
             logger.debug('Try connecting to {}'.format(srv['ip']))
             res = getping(srv['ip'], COUNT, interface=None, port=srv['port'])
             dtime = sql_fetchoneone(cur, "SELECT NOW()")
@@ -391,10 +391,7 @@ def update_ping(srvs):
                 logger.debug('Host does not exist {}'.format(srv['ip']))
                 continue
             logger.debug('{} {}'.format(srv['ip'], res[0]))
-            if connect_vpn(srv, dest_addr, net_mask, record_guam_ping, (conn, cur, srv, auto_increment, dtime)):
-               pass
-            else:
-               conn.rollback()
+            connect_vpn(srv, update_tables, record_target_ping, (conn, cur, srv, auto_increment, dtime, update_tables))
             disconnect_vpn(srv['ip'])
         cur.close()
         conn.close()
@@ -527,12 +524,23 @@ def task():
 
 
 if __name__ == '__main__':
-    if (len(sys.argv) > 2) and (sys.argv[2] == "debug"):
+    parser = argparse.ArgumentParser()
+    keys = list(config.keys())
+    keys.remove('general')
+    parser.add_argument('--settings', '-s', nargs='*', choices=keys, required=True)
+    parser.add_argument('--debug', '-d', action='store_true')
+    args = parser.parse_args()
+    if args.debug:
         import ptvsd
         print("waiting...")
         ptvsd.enable_attach(address=('0.0.0.0', 5678))
         ptvsd.wait_for_attach()
-    if (len(sys.argv) < 2):
+    tables.extend(args.settings)
+    for table in tables:
+        reliable = json.loads(config.get(table, 'reliable'))
+        ping_srvs[table] = {'reliable': reliable, 'idx': 0}
+    print(args)
+    """if (len(sys.argv) < 2):
         print('Please specify the config section you want to load')
         exit()
     reliable_srvs = json.loads(config.get(sys.argv[1], 'reliable'))
@@ -542,14 +550,15 @@ if __name__ == '__main__':
     failed_table = config.get(sys.argv[1], 'failed_table') if 'failed_table' in config[sys.argv[1]] else None
     unreach_table = config.get(sys.argv[1], 'unreach_table') if 'unreach_table' in config[sys.argv[1]] else None
     sevpn999_skip = config.getboolean(sys.argv[1], 'sevpn999_skip') if 'sevpn999_skip' in config[sys.argv[1]] else False
-    unreach_skip = config.getboolean(sys.argv[1], 'unreach_skip') if 'unreach_skip' in config[sys.argv[1]] else False
+    unreach_skip = config.getboolean(sys.argv[1], 'unreach_skip') if 'unreach_skip' in config[sys.argv[1]] else False"""
     init_logger()
     init_globalip()
     last = 0
     try:
-        while time.time() - last > 60:
-            task()
-            last = time.time()
+        while True:
+            if time.time() - last > 60:
+                task()
+                last = time.time()
             time.sleep(60)
     except Exception:
         logger.error("Exception", exc_info=True)

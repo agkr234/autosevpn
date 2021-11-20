@@ -17,6 +17,7 @@ ADD main_container.py /app
 ADD start.sh /app
 ADD reset.py /app
 ADD sevpn.ini /app
+ADD secret.ini /app
 
 RUN chmod -R 777 /app
 
